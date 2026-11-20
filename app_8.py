@@ -370,7 +370,7 @@ with tab_table:
             hide_index=True,
             height=560,
             column_config={
-                "Nama Bengkel": st.column_config.TextColumn(width=col_w(300, "large")),
+                "Nama Bengkel": st.column_config.TextColumn(width=col_w(170, "medium")),
                 "No SPK": st.column_config.TextColumn(width=col_w(180, "medium")),
                 "Status Pembebanan": st.column_config.TextColumn(width=col_w(150, "medium")),
                 "Tgl SPK": st.column_config.DateColumn(
@@ -433,7 +433,7 @@ with tab_insights:
         hide_index=True,
         height=min(600, 38 + 35 * len(latest)),
         column_config={
-            "Nama Bengkel": st.column_config.TextColumn(width=col_w(300, "large")),
+            "Nama Bengkel": st.column_config.TextColumn(width=col_w(170, "medium")),
             "Latest Tgl Input SPK": st.column_config.DatetimeColumn(
                 format="DD MMM YYYY, HH:mm", width=col_w(190, "medium")
             ),
