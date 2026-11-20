@@ -1,225 +1,325 @@
-import streamlit as st
-import pandas as pd
 import datetime
+
+import pandas as pd
+import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 
 # ==========================================
-# 1. PAGE CONFIGURATION
+# 1. PAGE CONFIG + SMALL STYLE TWEAKS
 # ==========================================
 st.set_page_config(
     page_title="SPK Table Dashboard",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("📊 Database Records")
-st.markdown("---")
+st.markdown(
+    """
+    <style>
+        .block-container { padding-top: 2rem; padding-bottom: 2rem; }
+        [data-testid="stMetricValue"] { font-size: 2rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ==========================================
-# 2. MYSQL DATABASE CONNECTION
-# ==========================================
-@st.cache_resource
-def get_connection():
-    try:
-        db_config = st.secrets["mysql"]
-        connection_url = URL.create(
-            drivername="mysql+pymysql",
-            username=db_config["DB_USER"],
-            password=db_config["DB_PASSWORD"],
-            host=db_config["DB_HOST"],
-            port=int(db_config["DB_PORT"]),
-            database=db_config["DB_NAME"],
-        )
-    except KeyError as e:
-        raise KeyError(f"Missing secret key: {e}. Check your .streamlit/secrets.toml configuration.")
-
-    return create_engine(
-        connection_url,
-        pool_pre_ping=True,
-        pool_recycle=1800,
-    )
-
+# Newer Streamlit versions replace use_container_width with width="stretch"
 try:
-    engine = get_connection()
-    with engine.connect() as connection:
-        connection.execute(text("SELECT 1"))
-    st.sidebar.success("✅ MySQL Connected")
-except Exception as e:
-    st.error(f"Database Connection Failed: {e}")
-    st.stop()
+    _major, _minor = (int(x) for x in st.__version__.split(".")[:2])
+    STRETCH = {"width": "stretch"} if (_major, _minor) >= (1, 50) else {"use_container_width": True}
+except Exception:
+    STRETCH = {"use_container_width": True}
 
 # ==========================================
-# 3. LOAD DATA FROM MYSQL
+# 2. CONSTANTS
 # ==========================================
 TABLE_NAME = "view_penerimaan_LSN"
-DATE_COLS = ["tglspk", "tglterima", "tglinputspk"]
+YEAR = datetime.date.today().year
+YEAR_START = datetime.date(YEAR, 1, 1)
+YEAR_END = datetime.date(YEAR, 12, 31)
 
-@st.cache_data(ttl=600)
+DATE_COLS = {
+    "tglspk": "Tgl SPK",
+    "tglterima": "Tgl Terima",
+    "tglinputspk": "Tgl Input SPK",
+}
+STATUS_ICON = {"Sudah": "✅ Sudah", "Belum": "⏳ Belum"}
+
+FILTER_KEYS = [
+    "f_bengkel", "f_spk", "f_status",
+    "f_tglspk", "f_tglterima", "f_tglinputspk", "f_keep_null",
+]
+
+
+# ==========================================
+# 3. DATABASE (cached engine + cached data)
+# ==========================================
+@st.cache_resource
+def get_engine():
+    try:
+        cfg = st.secrets["mysql"]
+        url = URL.create(
+            drivername="mysql+pymysql",
+            username=cfg["DB_USER"],
+            password=cfg["DB_PASSWORD"],
+            host=cfg["DB_HOST"],
+            port=int(cfg["DB_PORT"]),
+            database=cfg["DB_NAME"],
+        )
+    except KeyError as e:
+        raise KeyError(f"Missing secret key: {e}. Check .streamlit/secrets.toml.")
+
+    return create_engine(
+        url,
+        pool_size=5,
+        max_overflow=5,
+        pool_pre_ping=True,   # replaces the SELECT 1 check on every rerun
+        pool_recycle=1800,
+        connect_args={"connect_timeout": 10},
+    )
+
+
+@st.cache_data(ttl=600, show_spinner="Loading records…")
 def load_data(_engine):
-    current_year = datetime.date.today().year
-
-    # Fetch only needed columns and filter dates in MySQL
+    # Plain range comparisons (instead of YEAR(col) = ...) let MySQL use an
+    # index on these columns, and sorting is left to pandas.
     query = text(f"""
         SELECT namabengkel, no_spk, status_pembebanan, tglspk, tglterima, tglinputspk
         FROM `{TABLE_NAME}`
-        WHERE YEAR(`tglinputspk`) = :year
-          AND (YEAR(`tglspk`) = :year OR `tglspk` IS NULL)
-          AND (YEAR(`tglterima`) = :year OR `tglterima` IS NULL)
-        ORDER BY `tglinputspk` DESC
+        WHERE tglinputspk >= :start AND tglinputspk < :end
+          AND (tglspk    IS NULL OR (tglspk    >= :start AND tglspk    < :end))
+          AND (tglterima IS NULL OR (tglterima >= :start AND tglterima < :end))
     """)
-    df = pd.read_sql(query, _engine, params={"year": current_year})
+    params = {"start": YEAR_START, "end": datetime.date(YEAR + 1, 1, 1)}
 
-    # Convert date columns safely (typos like 2925 become NaT), then to plain dates
+    with _engine.connect() as conn:
+        df = pd.read_sql(query, conn, params=params)
+
+    # Real datetime columns allow fast vectorized filtering; bad dates become NaT
     for col in DATE_COLS:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+        df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    return df
+    # Categories use less memory and make filtering faster
+    df["namabengkel"] = df["namabengkel"].astype("category")
+    df["status_pembebanan"] = df["status_pembebanan"].astype("category")
 
-# --- FIX: actually call the loader so `df` exists ---
+    df = df.sort_values("tglinputspk", ascending=False, ignore_index=True)
+
+    try:
+        from zoneinfo import ZoneInfo
+        loaded_at = datetime.datetime.now(ZoneInfo("Asia/Jakarta"))
+    except Exception:
+        loaded_at = datetime.datetime.now()
+
+    return df, loaded_at
+
+
 try:
-    df = load_data(engine)
+    df, loaded_at = load_data(get_engine())
 except Exception as e:
-    st.error(f"Failed to load data: {e}")
+    st.error(f"Could not load data: {e}")
+    if st.button("Try again"):
+        load_data.clear()
+        st.rerun()
     st.stop()
 
+
 # ==========================================
-# 4. SIDEBAR FILTERS
+# 4. HEADER
 # ==========================================
-def add_date_slider(data, col_name, label):
-    """Render a date-range slider and return the filtered dataframe.
-    Rows with an empty date are kept, so NULL dates don't vanish."""
-    if col_name not in data.columns:
-        return data
-
-    valid_dates = data[col_name].dropna()
-    if valid_dates.empty:
-        return data
-
-    current_year = datetime.date.today().year
-    start_of_year = datetime.date(current_year, 1, 1)
-    end_of_year = datetime.date(current_year, 12, 31)
-
-    min_d = max(valid_dates.min(), start_of_year)
-    max_d = min(valid_dates.max(), end_of_year)
-
-    if min_d > max_d:
-        return data
-
-    date_range = st.slider(
-        label,
-        min_value=start_of_year,
-        max_value=end_of_year,
-        value=(min_d, max_d),
+head_left, head_right = st.columns([4, 1], vertical_alignment="center")
+with head_left:
+    st.title("📊 Penerimaan LSN")
+    st.caption(
+        f"{TABLE_NAME} • {YEAR} • updated {loaded_at:%d %b %Y, %H:%M} "
+        f"(refreshes automatically every 10 minutes)"
     )
-
-    in_range = data[col_name].apply(
-        lambda d: pd.isna(d) or (date_range[0] <= d <= date_range[1])
-    )
-    return data[in_range]
-
-
-with st.sidebar.form(key="filter_form"):
-    st.header("🔍 Filter Data")
-
-    filtered_df = df.copy()
-
-    # A. Multiselect for "namabengkel"
-    if "namabengkel" in filtered_df.columns:
-        bengkel_list = sorted(filtered_df["namabengkel"].dropna().unique())
-        selected_bengkel = st.multiselect("Nama Bengkel", options=bengkel_list)
-        if selected_bengkel:
-            filtered_df = filtered_df[filtered_df["namabengkel"].isin(selected_bengkel)]
-
-    # B. Search for "no_spk"
-    if "no_spk" in filtered_df.columns:
-        search_spk = st.text_input("Search No SPK")
-        if search_spk:
-            filtered_df = filtered_df[
-                filtered_df["no_spk"].astype(str).str.contains(search_spk, case=False, na=False, regex=False)
-            ]
-
-    # C. Selectbox for "status_pembebanan"
-    if "status_pembebanan" in filtered_df.columns:
-        status_list = ["All"] + sorted(filtered_df["status_pembebanan"].dropna().unique())
-        selected_status = st.selectbox("Status Pembebanan", options=status_list)
-        if selected_status != "All":
-            filtered_df = filtered_df[filtered_df["status_pembebanan"] == selected_status]
-
-    # D. Date sliders
-    st.markdown("### 📅 Date Filters")
-    filtered_df = add_date_slider(filtered_df, "tglspk", "Tanggal SPK")
-    filtered_df = add_date_slider(filtered_df, "tglterima", "Tanggal Terima")
-    filtered_df = add_date_slider(filtered_df, "tglinputspk", "Tanggal Input SPK")
-
-    submit_button = st.form_submit_button(label="Apply Filters", use_container_width=True)
-
-# ==========================================
-# 5. DASHBOARD METRICS (SCORE CARDS)
-# ==========================================
-if "status_pembebanan" in filtered_df.columns:
-    sudah_count = int((filtered_df["status_pembebanan"] == "Sudah").sum())
-    belum_count = int((filtered_df["status_pembebanan"] == "Belum").sum())
-else:
-    sudah_count = belum_count = 0
-
-col1, col2, col3, col4 = st.columns([1, 1, 1, 1.5])
-
-with col1:
-    st.metric(label="✅ Status: Sudah", value=f"{sudah_count:,}")
-
-with col2:
-    st.metric(label="⏳ Status: Belum", value=f"{belum_count:,}")
-
-with col3:
-    st.metric(label="Total Records", value=f"{len(filtered_df):,}")
-
-with col4:
-    st.write("")
-    if st.button("🔄 Refresh / Reset Data", use_container_width=True):
+with head_right:
+    if st.button("🔄 Refresh data", **STRETCH):
         load_data.clear()
         st.rerun()
 
-st.markdown("---")
+if df.empty:
+    st.info(f"No records found for {YEAR}.")
+    st.stop()
 
 # ==========================================
-# 6. DISPLAY DATABASE TABLE (REORDER & RENAME)
+# 5. SIDEBAR FILTERS (live, no Apply button)
 # ==========================================
-st.subheader(f"Penerimaan LSN ({len(filtered_df):,} results)")
+def reset_filters():
+    for key in FILTER_KEYS:
+        st.session_state.pop(key, None)
 
-target_order = [
-    "namabengkel",
-    "no_spk",
-    "status_pembebanan",
-    "tglspk",
-    "tglterima",
-    "tglinputspk",
-]
 
-available_cols = [c for c in target_order if c in filtered_df.columns]
-remaining_cols = [c for c in filtered_df.columns if c not in available_cols]
-display_df = filtered_df[available_cols + remaining_cols].copy()
+def date_bounds(series):
+    valid = series.dropna()
+    lo = max(valid.min().date(), YEAR_START) if not valid.empty else YEAR_START
+    hi = min(valid.max().date(), YEAR_END) if not valid.empty else YEAR_END
+    return lo, hi
 
-column_mapping = {
-    "namabengkel": "Nama Bengkel",
-    "no_spk": "No SPK",
-    "status_pembebanan": "Status Pembebanan",
-    "tglspk": "tgl SPK",
-    "tglterima": "tgl terima",
-    "tglinputspk": "tgl input SPK",
-}
-display_df = display_df.rename(columns=column_mapping)
 
-st.dataframe(
-    display_df,
-    use_container_width=True,
-    hide_index=True,
-    height=600,
-)
+with st.sidebar:
+    st.header("🔍 Filters")
+    st.button("Reset filters", on_click=reset_filters, **STRETCH)
+
+    bengkel_options = list(df["namabengkel"].cat.categories)
+    selected_bengkel = st.multiselect(
+        "Nama Bengkel", bengkel_options, key="f_bengkel", placeholder="All workshops"
+    )
+
+    search_spk = st.text_input(
+        "No SPK", key="f_spk", placeholder="Type part of a number, then press Enter"
+    ).strip()
+
+    status_options = ["All"] + list(df["status_pembebanan"].cat.categories)
+    selected_status = st.radio(
+        "Status Pembebanan", status_options, key="f_status", horizontal=True
+    )
+
+    date_ranges = {}
+    with st.expander("📅 Date filters"):
+        for col, label in DATE_COLS.items():
+            lo, hi = date_bounds(df[col])
+            chosen = st.date_input(
+                label,
+                value=(lo, hi),
+                min_value=YEAR_START,
+                max_value=YEAR_END,
+                key=f"f_{col}",
+            )
+            date_ranges[col] = (chosen, (lo, hi))
+        keep_null = st.checkbox(
+            "Keep rows with empty dates",
+            value=True,
+            key="f_keep_null",
+            help="When a date range is narrowed, keep records that have no date in that column.",
+        )
 
 # ==========================================
-# 7. FOOTER
+# 6. APPLY FILTERS (vectorized, single mask)
 # ==========================================
-st.markdown("---")
-st.caption("SPK Table Dashboard | MySQL Database")
+mask = pd.Series(True, index=df.index)
+active = []
+
+if selected_bengkel:
+    mask &= df["namabengkel"].isin(selected_bengkel)
+    active.append(f"{len(selected_bengkel)} workshop(s)")
+
+if search_spk:
+    mask &= df["no_spk"].astype(str).str.contains(search_spk, case=False, na=False, regex=False)
+    active.append(f"SPK contains “{search_spk}”")
+
+if selected_status != "All":
+    mask &= df["status_pembebanan"] == selected_status
+    active.append(selected_status)
+
+for col, (chosen, default) in date_ranges.items():
+    # date_input returns a single date while the user is still picking the end date
+    if not (isinstance(chosen, tuple) and len(chosen) == 2) or tuple(chosen) == default:
+        continue
+    start = pd.Timestamp(chosen[0])
+    end = pd.Timestamp(chosen[1]) + pd.Timedelta(days=1)
+    in_range = (df[col] >= start) & (df[col] < end)
+    if keep_null:
+        in_range |= df[col].isna()
+    mask &= in_range
+    active.append(DATE_COLS[col])
+
+view = df[mask]
+
+with st.sidebar:
+    st.caption(f"Showing {len(view):,} of {len(df):,} records")
+
+# ==========================================
+# 7. METRICS
+# ==========================================
+total = len(view)
+sudah = int((view["status_pembebanan"] == "Sudah").sum())
+belum = int((view["status_pembebanan"] == "Belum").sum())
+rate = sudah / total if total else 0.0
+
+m1, m2, m3, m4 = st.columns(4)
+for box, label, value in (
+    (m1, "Total records", f"{total:,}"),
+    (m2, "✅ Sudah", f"{sudah:,}"),
+    (m3, "⏳ Belum", f"{belum:,}"),
+    (m4, "Completion", f"{rate:.0%}"),
+):
+    with box.container(border=True):
+        st.metric(label, value)
+
+st.progress(rate, text=f"{sudah:,} of {total:,} records are Sudah")
+
+if active:
+    st.caption("Active filters: " + " • ".join(active))
+
+if view.empty:
+    st.info("No records match these filters. Remove a filter or click **Reset filters** in the sidebar.")
+    st.stop()
+
+# ==========================================
+# 8. TABS: RECORDS + INSIGHTS
+# ==========================================
+tab_table, tab_insights = st.tabs(["📋 Records", "📈 Insights"])
+
+with tab_table:
+    table = pd.DataFrame(
+        {
+            "Nama Bengkel": view["namabengkel"].astype("object"),
+            "No SPK": view["no_spk"],
+            "Status Pembebanan": view["status_pembebanan"].astype("object").map(STATUS_ICON).fillna(
+                view["status_pembebanan"].astype("object")
+            ),
+            **{label: view[col] for col, label in DATE_COLS.items()},
+        }
+    )
+
+    csv_bytes = table.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "⬇️ Download filtered data (CSV)",
+        data=csv_bytes,
+        file_name=f"penerimaan_lsn_{YEAR}.csv",
+        mime="text/csv",
+    )
+
+    st.dataframe(
+        table,
+        hide_index=True,
+        height=560,
+        column_config={
+            "Nama Bengkel": st.column_config.TextColumn(width="large"),
+            "No SPK": st.column_config.TextColumn(width="medium"),
+            "Status Pembebanan": st.column_config.TextColumn(width="small"),
+            **{
+                label: st.column_config.DateColumn(format="DD MMM YYYY", width="small")
+                for label in DATE_COLS.values()
+            },
+        },
+        **STRETCH,
+    )
+
+with tab_insights:
+    chart_left, chart_right = st.columns(2)
+
+    with chart_left:
+        st.subheader("Top 10 workshops")
+        by_bengkel = (
+            view.groupby(["namabengkel", "status_pembebanan"], observed=True)
+            .size()
+            .unstack(fill_value=0)
+        )
+        top_index = by_bengkel.sum(axis=1).sort_values(ascending=False).head(10).index
+        st.bar_chart(by_bengkel.loc[top_index])
+
+    with chart_right:
+        st.subheader("SPK input per week")
+        weekly = (
+            view.dropna(subset=["tglinputspk"])
+            .set_index("tglinputspk")
+            .resample("W")
+            .size()
+            .rename("SPK inputs")
+        )
+        st.bar_chart(weekly)
