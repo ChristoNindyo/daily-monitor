@@ -1,4 +1,5 @@
 import datetime
+import html
 
 import pandas as pd
 import streamlit as st
@@ -12,7 +13,7 @@ st.set_page_config(
     page_title="SPK Table Dashboard",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
 st.markdown(
@@ -20,6 +21,34 @@ st.markdown(
     <style>
         .block-container { padding-top: 2rem; padding-bottom: 2rem; }
         [data-testid="stMetricValue"] { font-size: 2rem; }
+
+        /* Record cards (mobile-friendly list) */
+        .spk-card { border: 1px solid rgba(128,128,128,.35); border-radius: .6rem;
+                    padding: .7rem .85rem; margin-bottom: .6rem; }
+        .spk-head { display: flex; justify-content: space-between;
+                    align-items: baseline; gap: .5rem; }
+        .spk-no { font-weight: 600; font-size: 1.05rem; word-break: break-all; }
+        .spk-status { white-space: nowrap; font-size: .9rem; }
+        .spk-bengkel { opacity: .75; margin: .1rem 0 .55rem; }
+        .spk-dates { display: flex; flex-wrap: wrap; gap: .4rem 1.4rem;
+                     font-size: .78rem; opacity: .85; }
+        .spk-dates b { font-weight: 500; font-size: .86rem; }
+
+        /* Phones */
+        @media (max-width: 640px) {
+            .block-container { padding: 1rem .75rem 2rem; }
+            h1 { font-size: 1.6rem !important; }
+            [data-testid="stMetricValue"] { font-size: 1.5rem; }
+            /* metric cards in a 2 x 2 grid instead of one tall column */
+            div[data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) {
+                flex-wrap: wrap; gap: .5rem;
+            }
+            div[data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) > div {
+                flex: 1 1 calc(50% - .5rem) !important;
+                min-width: calc(50% - .5rem) !important;
+                width: calc(50% - .5rem) !important;
+            }
+        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -28,9 +57,16 @@ st.markdown(
 # Newer Streamlit versions replace use_container_width with width="stretch"
 try:
     _major, _minor = (int(x) for x in st.__version__.split(".")[:2])
-    STRETCH = {"width": "stretch"} if (_major, _minor) >= (1, 50) else {"use_container_width": True}
+    NEW_API = (_major, _minor) >= (1, 50)
 except Exception:
-    STRETCH = {"use_container_width": True}
+    NEW_API = False
+
+STRETCH = {"width": "stretch"} if NEW_API else {"use_container_width": True}
+
+
+def col_w(pixels, preset):
+    """Exact pixel width on newer Streamlit, small/medium/large on older versions."""
+    return pixels if NEW_API else preset
 
 # ==========================================
 # 2. CONSTANTS
@@ -149,7 +185,7 @@ if df.empty:
 # 5. SIDEBAR FILTERS (live, no Apply button)
 # ==========================================
 def reset_filters():
-    for key in FILTER_KEYS:
+    for key in FILTER_KEYS + ["card_limit"]:
         st.session_state.pop(key, None)
 
 
@@ -262,9 +298,51 @@ if view.empty:
 # ==========================================
 # 8. TABS: RECORDS + INSIGHTS
 # ==========================================
+def esc(value):
+    return "-" if pd.isna(value) else html.escape(str(value))
+
+
+def fmt_date(value, with_time=False):
+    if pd.isna(value):
+        return "-"
+    return value.strftime("%d %b %Y, %H:%M" if with_time else "%d %b %Y")
+
+
+def render_cards(data, page_size=20):
+    """Compact card list: easy to read on a phone, no horizontal scrolling."""
+    limit = st.session_state.get("card_limit", page_size)
+    cards = []
+    for r in data.head(limit).itertuples(index=False):
+        status = STATUS_ICON.get(r.status_pembebanan, r.status_pembebanan)
+        cards.append(
+            '<div class="spk-card">'
+            f'<div class="spk-head"><span class="spk-no">{esc(r.no_spk)}</span>'
+            f'<span class="spk-status">{esc(status)}</span></div>'
+            f'<div class="spk-bengkel">{esc(r.namabengkel)}</div>'
+            '<div class="spk-dates">'
+            f'<span>Tgl SPK<br><b>{fmt_date(r.tglspk)}</b></span>'
+            f'<span>Tgl Terima<br><b>{fmt_date(r.tglterima)}</b></span>'
+            f'<span>Tgl Input SPK<br><b>{fmt_date(r.tglinputspk, True)}</b></span>'
+            '</div></div>'
+        )
+    st.markdown("".join(cards), unsafe_allow_html=True)
+
+    remaining = len(data) - limit
+    if remaining > 0:
+        if st.button(f"Show more ({remaining:,} left)", **STRETCH):
+            st.session_state["card_limit"] = limit + page_size
+            st.rerun()
+
+
 tab_table, tab_insights = st.tabs(["📋 Records", "📈 Insights"])
 
 with tab_table:
+    layout = st.radio(
+        "Layout", ["Table", "Cards"], horizontal=True,
+        key="layout", label_visibility="collapsed",
+        help="Table is best on a computer. Cards are easier to read on a phone.",
+    )
+
     table = pd.DataFrame(
         {
             "Nama Bengkel": view["namabengkel"].astype("object"),
@@ -284,22 +362,29 @@ with tab_table:
         mime="text/csv",
     )
 
-    st.dataframe(
-        table,
-        hide_index=True,
-        height=560,
-        column_config={
-            "Nama Bengkel": st.column_config.TextColumn(width="large"),
-            "No SPK": st.column_config.TextColumn(width="medium"),
-            "Status Pembebanan": st.column_config.TextColumn(width="small"),
-            "Tgl SPK": st.column_config.DateColumn(format="DD MMM YYYY", width="small"),
-            "Tgl Terima": st.column_config.DateColumn(format="DD MMM YYYY", width="small"),
-            "Tgl Input SPK": st.column_config.DatetimeColumn(
-                format="DD MMM YYYY, HH:mm", width="medium"
-            ),
-        },
-        **STRETCH,
-    )
+    if layout == "Cards":
+        render_cards(view)
+    else:
+        st.dataframe(
+            table,
+            hide_index=True,
+            height=560,
+            column_config={
+                "Nama Bengkel": st.column_config.TextColumn(width=col_w(300, "large")),
+                "No SPK": st.column_config.TextColumn(width=col_w(180, "medium")),
+                "Status Pembebanan": st.column_config.TextColumn(width=col_w(150, "medium")),
+                "Tgl SPK": st.column_config.DateColumn(
+                    format="DD MMM YYYY", width=col_w(120, "medium")
+                ),
+                "Tgl Terima": st.column_config.DateColumn(
+                    format="DD MMM YYYY", width=col_w(120, "medium")
+                ),
+                "Tgl Input SPK": st.column_config.DatetimeColumn(
+                    format="DD MMM YYYY, HH:mm", width=col_w(170, "medium")
+                ),
+            },
+            **STRETCH,
+        )
 
 with tab_insights:
     chart_left, chart_right = st.columns(2)
@@ -348,11 +433,13 @@ with tab_insights:
         hide_index=True,
         height=min(600, 38 + 35 * len(latest)),
         column_config={
-            "Nama Bengkel": st.column_config.TextColumn(width="large"),
+            "Nama Bengkel": st.column_config.TextColumn(width=col_w(300, "large")),
             "Latest Tgl Input SPK": st.column_config.DatetimeColumn(
-                format="DD MMM YYYY, HH:mm", width="medium"
+                format="DD MMM YYYY, HH:mm", width=col_w(190, "medium")
             ),
-            "Total Records": st.column_config.NumberColumn(format="%d", width="small"),
+            "Total Records": st.column_config.NumberColumn(
+                format="%d", width=col_w(120, "medium")
+            ),
         },
         **STRETCH,
     )
