@@ -3,7 +3,6 @@ import pandas as pd
 import datetime
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
-from sqlalchemy.exc import SQLAlchemyError
 
 # ==========================================
 # 1. PAGE CONFIGURATION
@@ -54,108 +53,116 @@ except Exception as e:
 # 3. LOAD DATA FROM MYSQL
 # ==========================================
 TABLE_NAME = "view_penerimaan_LSN"
+DATE_COLS = ["tglspk", "tglterima", "tglinputspk"]
 
 @st.cache_data(ttl=600)
 def load_data(_engine):
     current_year = datetime.date.today().year
-    
-    # 1. Optimize: Fetch only needed columns AND filter all dates in MySQL
+
+    # Fetch only needed columns and filter dates in MySQL
     query = text(f"""
-        SELECT namabengkel, no_spk, status_pembebanan, tglspk, tglterima, tglinputspk 
-        FROM `{TABLE_NAME}` 
-        WHERE YEAR(`tglinputspk`) = {current_year}
-          AND (YEAR(`tglspk`) = {current_year} OR `tglspk` IS NULL)
-          AND (YEAR(`tglterima`) = {current_year} OR `tglterima` IS NULL)
+        SELECT namabengkel, no_spk, status_pembebanan, tglspk, tglterima, tglinputspk
+        FROM `{TABLE_NAME}`
+        WHERE YEAR(`tglinputspk`) = :year
+          AND (YEAR(`tglspk`) = :year OR `tglspk` IS NULL)
+          AND (YEAR(`tglterima`) = :year OR `tglterima` IS NULL)
         ORDER BY `tglinputspk` DESC
     """)
-    df = pd.read_sql(query, _engine)
-    
-    # 2. Convert date columns safely (forces typos like 2925 to NaT)
-    date_cols = ['tglspk', 'tglterima', 'tglinputspk']
-    for col in date_cols:
+    df = pd.read_sql(query, _engine, params={"year": current_year})
+
+    # Convert date columns safely (typos like 2925 become NaT), then to plain dates
+    for col in DATE_COLS:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
-            
-    # Note: Step 3 (STRICT FILTER) was deleted from here because MySQL now handles it!
-            
-    # 4. Convert back to standard date format for the Streamlit UI
-    for col in date_cols:
-        if col in df.columns:
-            df[col] = df[col].dt.date
-            
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+
     return df
+
+# --- FIX: actually call the loader so `df` exists ---
+try:
+    df = load_data(engine)
+except Exception as e:
+    st.error(f"Failed to load data: {e}")
+    st.stop()
 
 # ==========================================
 # 4. SIDEBAR FILTERS
 # ==========================================
-with st.sidebar.form(key='filter_form'):
+def add_date_slider(data, col_name, label):
+    """Render a date-range slider and return the filtered dataframe.
+    Rows with an empty date are kept, so NULL dates don't vanish."""
+    if col_name not in data.columns:
+        return data
+
+    valid_dates = data[col_name].dropna()
+    if valid_dates.empty:
+        return data
+
+    current_year = datetime.date.today().year
+    start_of_year = datetime.date(current_year, 1, 1)
+    end_of_year = datetime.date(current_year, 12, 31)
+
+    min_d = max(valid_dates.min(), start_of_year)
+    max_d = min(valid_dates.max(), end_of_year)
+
+    if min_d > max_d:
+        return data
+
+    date_range = st.slider(
+        label,
+        min_value=start_of_year,
+        max_value=end_of_year,
+        value=(min_d, max_d),
+    )
+
+    in_range = data[col_name].apply(
+        lambda d: pd.isna(d) or (date_range[0] <= d <= date_range[1])
+    )
+    return data[in_range]
+
+
+with st.sidebar.form(key="filter_form"):
     st.header("🔍 Filter Data")
 
     filtered_df = df.copy()
 
-    # A. Dropdown for "namabengkel"
+    # A. Multiselect for "namabengkel"
     if "namabengkel" in filtered_df.columns:
-        bengkel_list = filtered_df["namabengkel"].dropna().unique()
-        # Changed st.sidebar.multiselect to st.multiselect
+        bengkel_list = sorted(filtered_df["namabengkel"].dropna().unique())
         selected_bengkel = st.multiselect("Nama Bengkel", options=bengkel_list)
         if selected_bengkel:
             filtered_df = filtered_df[filtered_df["namabengkel"].isin(selected_bengkel)]
 
     # B. Search for "no_spk"
     if "no_spk" in filtered_df.columns:
-        # Changed st.sidebar.text_input to st.text_input
         search_spk = st.text_input("Search No SPK")
         if search_spk:
-            filtered_df = filtered_df[filtered_df["no_spk"].astype(str).str.contains(search_spk, case=False, na=False)]
+            filtered_df = filtered_df[
+                filtered_df["no_spk"].astype(str).str.contains(search_spk, case=False, na=False, regex=False)
+            ]
 
-    # C. Select for "status_pembebanan"
+    # C. Selectbox for "status_pembebanan"
     if "status_pembebanan" in filtered_df.columns:
-        status_list = ["All"] + list(filtered_df["status_pembebanan"].dropna().unique())
-        # Changed st.sidebar.selectbox to st.selectbox
+        status_list = ["All"] + sorted(filtered_df["status_pembebanan"].dropna().unique())
         selected_status = st.selectbox("Status Pembebanan", options=status_list)
         if selected_status != "All":
             filtered_df = filtered_df[filtered_df["status_pembebanan"] == selected_status]
 
-    # D. Date Sliders for "tglspk", "tglterima", "tglinputspk"
-    def add_date_slider(col_name, label):
-        global filtered_df
-        if col_name in filtered_df.columns:
-            valid_dates = filtered_df[col_name].dropna()
-            if not valid_dates.empty:
-                
-                # Lock the UI limits strictly to Jan 1 - Dec 31 of THIS year
-                current_year = datetime.date.today().year
-                start_of_year = datetime.date(current_year, 1, 1)
-                end_of_year = datetime.date(current_year, 12, 31)
-                
-                # Clamp the default slider values to ensure they don't break boundaries
-                min_d = max(valid_dates.min(), start_of_year)
-                max_d = min(valid_dates.max(), end_of_year)
-                
-                if min_d <= max_d:
-                    # Changed st.sidebar.slider to st.slider
-                    date_range = st.slider(
-                        label, 
-                        min_value=start_of_year, 
-                        max_value=end_of_year, 
-                        value=(min_d, max_d)
-                    )
-                    filtered_df = filtered_df[(filtered_df[col_name] >= date_range[0]) & (filtered_df[col_name] <= date_range[1])]
-
-    # Changed st.sidebar.markdown to st.markdown
+    # D. Date sliders
     st.markdown("### 📅 Date Filters")
-    add_date_slider("tglspk", "Tanggal SPK")
-    add_date_slider("tglterima", "Tanggal Terima")
-    add_date_slider("tglinputspk", "Tanggal Input SPK")
+    filtered_df = add_date_slider(filtered_df, "tglspk", "Tanggal SPK")
+    filtered_df = add_date_slider(filtered_df, "tglterima", "Tanggal Terima")
+    filtered_df = add_date_slider(filtered_df, "tglinputspk", "Tanggal Input SPK")
 
-    # Add the submit button at the bottom of the form
     submit_button = st.form_submit_button(label="Apply Filters", use_container_width=True)
 
 # ==========================================
 # 5. DASHBOARD METRICS (SCORE CARDS)
 # ==========================================
-sudah_count = len(filtered_df[filtered_df["status_pembebanan"] == "Sudah"]) if "status_pembebanan" in filtered_df.columns else 0
-belum_count = len(filtered_df[filtered_df["status_pembebanan"] == "Belum"]) if "status_pembebanan" in filtered_df.columns else 0
+if "status_pembebanan" in filtered_df.columns:
+    sudah_count = int((filtered_df["status_pembebanan"] == "Sudah").sum())
+    belum_count = int((filtered_df["status_pembebanan"] == "Belum").sum())
+else:
+    sudah_count = belum_count = 0
 
 col1, col2, col3, col4 = st.columns([1, 1, 1, 1.5])
 
@@ -169,7 +176,7 @@ with col3:
     st.metric(label="Total Records", value=f"{len(filtered_df):,}")
 
 with col4:
-    st.write("") 
+    st.write("")
     if st.button("🔄 Refresh / Reset Data", use_container_width=True):
         load_data.clear()
         st.rerun()
@@ -179,43 +186,36 @@ st.markdown("---")
 # ==========================================
 # 6. DISPLAY DATABASE TABLE (REORDER & RENAME)
 # ==========================================
-st.subheader(f"Penerimaan LSN ({len(filtered_df)} results)")
+st.subheader(f"Penerimaan LSN ({len(filtered_df):,} results)")
 
-# Define the exact column order requested
 target_order = [
-    "namabengkel", 
-    "no_spk", 
-    "status_pembebanan", 
-    "tglspk", 
-    "tglterima", 
-    "tglinputspk"
+    "namabengkel",
+    "no_spk",
+    "status_pembebanan",
+    "tglspk",
+    "tglterima",
+    "tglinputspk",
 ]
 
-# Ensure we only try to reorder columns that actually exist in the dataframe
-available_cols = [col for col in target_order if col in filtered_df.columns]
-remaining_cols = [col for col in filtered_df.columns if col not in available_cols]
-final_order = available_cols + remaining_cols
+available_cols = [c for c in target_order if c in filtered_df.columns]
+remaining_cols = [c for c in filtered_df.columns if c not in available_cols]
+display_df = filtered_df[available_cols + remaining_cols].copy()
 
-# Reorder the dataframe
-display_df = filtered_df[final_order].copy()
-
-# Rename the columns for the UI
 column_mapping = {
     "namabengkel": "Nama Bengkel",
     "no_spk": "No SPK",
+    "status_pembebanan": "Status Pembebanan",
     "tglspk": "tgl SPK",
     "tglterima": "tgl terima",
     "tglinputspk": "tgl input SPK",
-    "status_pembebanan": "Status Pembebanan"
 }
 display_df = display_df.rename(columns=column_mapping)
 
-# Render the formatted table
 st.dataframe(
     display_df,
     use_container_width=True,
     hide_index=True,
-    height=600
+    height=600,
 )
 
 # ==========================================
