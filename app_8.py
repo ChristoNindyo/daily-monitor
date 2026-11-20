@@ -292,10 +292,11 @@ with tab_table:
             "Nama Bengkel": st.column_config.TextColumn(width="large"),
             "No SPK": st.column_config.TextColumn(width="medium"),
             "Status Pembebanan": st.column_config.TextColumn(width="small"),
-            **{
-                label: st.column_config.DateColumn(format="DD MMM YYYY", width="small")
-                for label in DATE_COLS.values()
-            },
+            "Tgl SPK": st.column_config.DateColumn(format="DD MMM YYYY", width="small"),
+            "Tgl Terima": st.column_config.DateColumn(format="DD MMM YYYY", width="small"),
+            "Tgl Input SPK": st.column_config.DatetimeColumn(
+                format="DD MMM YYYY, HH:mm", width="medium"
+            ),
         },
         **STRETCH,
     )
@@ -323,3 +324,35 @@ with tab_insights:
             .rename("SPK inputs")
         )
         st.bar_chart(weekly)
+
+    st.subheader("Latest Tgl Input SPK per workshop")
+    latest = (
+        view.dropna(subset=["tglinputspk"])
+        .groupby("namabengkel", observed=True)
+        .agg(
+            latest_input=("tglinputspk", "max"),
+            total_records=("no_spk", "size"),
+        )
+        .sort_values("latest_input", ascending=False)
+        .reset_index()
+        .rename(
+            columns={
+                "namabengkel": "Nama Bengkel",
+                "latest_input": "Latest Tgl Input SPK",
+                "total_records": "Total Records",
+            }
+        )
+    )
+    st.dataframe(
+        latest,
+        hide_index=True,
+        height=min(600, 38 + 35 * len(latest)),
+        column_config={
+            "Nama Bengkel": st.column_config.TextColumn(width="large"),
+            "Latest Tgl Input SPK": st.column_config.DatetimeColumn(
+                format="DD MMM YYYY, HH:mm", width="medium"
+            ),
+            "Total Records": st.column_config.NumberColumn(format="%d", width="small"),
+        },
+        **STRETCH,
+    )
