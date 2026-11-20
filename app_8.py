@@ -1,55 +1,27 @@
-import datetime
-import math
-from functools import reduce
-from operator import and_
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import datetime
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import SQLAlchemyError
 
 # ==========================================
-# 1. PAGE CONFIGURATION & STYLE
+# 1. PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(
     page_title="SPK Table Dashboard",
     page_icon="📊",
-    layout="wide",
+    layout="wide"
 )
 
-TABLE_NAME = "view_penerimaan_LSN"
-CACHE_TTL_SECONDS = 600
-DATE_COLS = ["tglspk", "tglterima", "tglinputspk"]
-
-# Yellow highlight for Status Pembebanan = "Belum" (dark text keeps it readable)
-HIGHLIGHT_BELUM = "background-color: #FFD43B; color: #1F1F1F; font-weight: 600;"
-
-# Pandas Styler refuses to render more cells than this (hard limit is 262,144).
-STYLER_MAX_CELLS = 200_000
-
-APP_CSS = """
-<style>
-/* Pull everything up: less empty space above the title */
-.block-container, [data-testid="stMainBlockContainer"] {
-    padding-top: 2.5rem !important;
-    padding-bottom: 1.5rem !important;
-}
-/* Slightly tighter spacing between elements */
-[data-testid="stMain"] [data-testid="stVerticalBlock"] { gap: 0.8rem; }
-/* Compact headings */
-.dash-title { font-size: 1.7rem; font-weight: 700; line-height: 1.2; margin: 0; padding: 0.2rem 0 0; }
-.table-title { font-size: 1.15rem; font-weight: 600; margin: 0; padding-top: 0.4rem; }
-/* Smaller metric numbers so the cards stay compact */
-[data-testid="stMetricValue"] { font-size: 1.9rem; }
-</style>
-"""
-
+st.title("📊 Database Records")
+st.markdown("---")
 
 # ==========================================
-# 2. MYSQL ENGINE (created once, shared by all sessions)
+# 2. MYSQL DATABASE CONNECTION
 # ==========================================
 @st.cache_resource
-def get_engine():
+def get_connection():
     try:
         db_config = st.secrets["mysql"]
         connection_url = URL.create(
@@ -61,270 +33,193 @@ def get_engine():
             database=db_config["DB_NAME"],
         )
     except KeyError as e:
-        raise KeyError(
-            f"Missing secret key: {e}. Check your .streamlit/secrets.toml configuration."
-        )
+        raise KeyError(f"Missing secret key: {e}. Check your .streamlit/secrets.toml configuration.")
 
     return create_engine(
         connection_url,
-        pool_pre_ping=True,   # silently replaces dead connections
+        pool_pre_ping=True,
         pool_recycle=1800,
-        connect_args={"connect_timeout": 10},
     )
-
-
-# ==========================================
-# 3. LOAD DATA FROM MYSQL
-# ==========================================
-# NOTE: cache_resource returns the SAME DataFrame object to every rerun/session
-# (no pickle/copy like cache_data). That is much faster for big tables, but the
-# cached DataFrame must be treated as READ-ONLY. Never modify `df` in place;
-# filtering/slicing below always creates new objects, which is safe.
-@st.cache_resource(ttl=CACHE_TTL_SECONDS, show_spinner="Loading data from MySQL...")
-def load_data(year: int) -> pd.DataFrame:
-    engine = get_engine()
-    year_start = datetime.date(year, 1, 1)
-    next_year_start = datetime.date(year + 1, 1, 1)
-
-    # Range comparisons (col >= start AND col < next_start) can use an index on
-    # the column. YEAR(col) = 2026 cannot: it forces MySQL to scan every row.
-    query = text(f"""
-        SELECT namabengkel, no_spk, status_pembebanan, tglspk, tglterima, tglinputspk
-        FROM `{TABLE_NAME}`
-        WHERE tglinputspk >= :start AND tglinputspk < :next_start
-          AND (tglspk IS NULL OR (tglspk >= :start AND tglspk < :next_start))
-          AND (tglterima IS NULL OR (tglterima >= :start AND tglterima < :next_start))
-    """)
-
-    with engine.connect() as conn:
-        df = pd.read_sql(
-            query,
-            conn,
-            params={"start": year_start, "next_start": next_year_start},
-        )
-
-    # Real datetime64 columns (fast, vectorised); normalize() drops time-of-day.
-    for col in DATE_COLS:
-        df[col] = pd.to_datetime(df[col], errors="coerce").dt.normalize()
-
-    # Low-cardinality text -> category: far less memory, faster isin / ==.
-    df["namabengkel"] = df["namabengkel"].astype("category")
-    df["status_pembebanan"] = df["status_pembebanan"].astype("category")
-    df["no_spk"] = df["no_spk"].astype("string")
-
-    # Sort once here (cached) instead of ORDER BY on the database server.
-    return df.sort_values("tglinputspk", ascending=False, ignore_index=True)
-
-
-# ==========================================
-# 4. HEADER ROW: title (left) + refresh button (right)
-# ==========================================
-# The CSS lives inside the title's markdown so it adds no extra blank element.
-title_col, refresh_col = st.columns([5, 1.2])
-with title_col:
-    st.markdown(
-        APP_CSS + '<div class="dash-title">📊 Database Records</div>',
-        unsafe_allow_html=True,
-    )
-with refresh_col:
-    if st.button("🔄 Refresh Data", use_container_width=True):
-        load_data.clear()
-        st.rerun()
 
 try:
-    today = datetime.date.today()
-    df = load_data(today.year)
+    engine = get_connection()
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+    st.sidebar.success("✅ MySQL Connected")
 except Exception as e:
     st.error(f"Database Connection Failed: {e}")
     st.stop()
 
-st.sidebar.caption("🟢 MySQL connected")
+# ==========================================
+# 3. LOAD DATA FROM MYSQL
+# ==========================================
+TABLE_NAME = "view_penerimaan_LSN"
+
+@st.cache_data(ttl=600)
+def load_data(_engine):
+    current_year = datetime.date.today().year
+    
+    # 1. Optimize: Fetch only needed columns AND filter all dates in MySQL
+    query = text(f"""
+        SELECT namabengkel, no_spk, status_pembebanan, tglspk, tglterima, tglinputspk 
+        FROM `{TABLE_NAME}` 
+        WHERE YEAR(`tglinputspk`) = {current_year}
+          AND (YEAR(`tglspk`) = {current_year} OR `tglspk` IS NULL)
+          AND (YEAR(`tglterima`) = {current_year} OR `tglterima` IS NULL)
+        ORDER BY `tglinputspk` DESC
+    """)
+    df = pd.read_sql(query, _engine)
+    
+    # 2. Convert date columns safely (forces typos like 2925 to NaT)
+    date_cols = ['tglspk', 'tglterima', 'tglinputspk']
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+            
+    # Note: Step 3 (STRICT FILTER) was deleted from here because MySQL now handles it!
+            
+    # 4. Convert back to standard date format for the Streamlit UI
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = df[col].dt.date
+            
+    return df
 
 # ==========================================
-# 5. SIDEBAR FILTERS
+# 4. SIDEBAR FILTERS
 # ==========================================
-# Every filter produces a boolean mask. All masks are combined and applied to
-# the DataFrame ONCE at the end (no repeated df.copy() / re-filtering).
-masks = []
-
-year_start = datetime.date(today.year, 1, 1)
-year_end = datetime.date(today.year, 12, 31)
-
-
-def date_range_mask(col_name: str, label: str):
-    """Render a date slider and return a mask, or None if not narrowed."""
-    series = df[col_name]
-    if series.notna().sum() == 0:
-        return None
-
-    # Defaults come from the full dataset so the widget stays stable between
-    # reruns (changing a slider's default would silently reset it).
-    default_start = max(series.min().date(), year_start)
-    default_end = min(series.max().date(), year_end)
-    if default_start > default_end:
-        return None
-
-    picked = st.slider(
-        label,
-        min_value=year_start,
-        max_value=year_end,
-        value=(default_start, default_end),
-    )
-
-    # Only filter when the user actually narrowed the range. This keeps rows
-    # with an empty date (NULL) visible until a date range is chosen.
-    if picked == (default_start, default_end):
-        return None
-    return (series >= pd.Timestamp(picked[0])) & (series <= pd.Timestamp(picked[1]))
-
-
-with st.sidebar.form(key="filter_form"):
+with st.sidebar.form(key='filter_form'):
     st.header("🔍 Filter Data")
 
+    filtered_df = df.copy()
+
     # A. Dropdown for "namabengkel"
-    selected_bengkel = st.multiselect(
-        "Nama Bengkel", options=df["namabengkel"].cat.categories.tolist()
-    )
-    if selected_bengkel:
-        masks.append(df["namabengkel"].isin(selected_bengkel))
+    if "namabengkel" in filtered_df.columns:
+        bengkel_list = filtered_df["namabengkel"].dropna().unique()
+        # Changed st.sidebar.multiselect to st.multiselect
+        selected_bengkel = st.multiselect("Nama Bengkel", options=bengkel_list)
+        if selected_bengkel:
+            filtered_df = filtered_df[filtered_df["namabengkel"].isin(selected_bengkel)]
 
     # B. Search for "no_spk"
-    search_spk = st.text_input("Search No SPK").strip()
-    if search_spk:
-        masks.append(
-            df["no_spk"].str.contains(search_spk, case=False, regex=False, na=False)
-        )
+    if "no_spk" in filtered_df.columns:
+        # Changed st.sidebar.text_input to st.text_input
+        search_spk = st.text_input("Search No SPK")
+        if search_spk:
+            filtered_df = filtered_df[filtered_df["no_spk"].astype(str).str.contains(search_spk, case=False, na=False)]
 
     # C. Select for "status_pembebanan"
-    status_list = ["All"] + df["status_pembebanan"].cat.categories.tolist()
-    selected_status = st.selectbox("Status Pembebanan", options=status_list)
-    if selected_status != "All":
-        masks.append(df["status_pembebanan"] == selected_status)
+    if "status_pembebanan" in filtered_df.columns:
+        status_list = ["All"] + list(filtered_df["status_pembebanan"].dropna().unique())
+        # Changed st.sidebar.selectbox to st.selectbox
+        selected_status = st.selectbox("Status Pembebanan", options=status_list)
+        if selected_status != "All":
+            filtered_df = filtered_df[filtered_df["status_pembebanan"] == selected_status]
 
-    # D. Date sliders
+    # D. Date Sliders for "tglspk", "tglterima", "tglinputspk"
+    def add_date_slider(col_name, label):
+        global filtered_df
+        if col_name in filtered_df.columns:
+            valid_dates = filtered_df[col_name].dropna()
+            if not valid_dates.empty:
+                
+                # Lock the UI limits strictly to Jan 1 - Dec 31 of THIS year
+                current_year = datetime.date.today().year
+                start_of_year = datetime.date(current_year, 1, 1)
+                end_of_year = datetime.date(current_year, 12, 31)
+                
+                # Clamp the default slider values to ensure they don't break boundaries
+                min_d = max(valid_dates.min(), start_of_year)
+                max_d = min(valid_dates.max(), end_of_year)
+                
+                if min_d <= max_d:
+                    # Changed st.sidebar.slider to st.slider
+                    date_range = st.slider(
+                        label, 
+                        min_value=start_of_year, 
+                        max_value=end_of_year, 
+                        value=(min_d, max_d)
+                    )
+                    filtered_df = filtered_df[(filtered_df[col_name] >= date_range[0]) & (filtered_df[col_name] <= date_range[1])]
+
+    # Changed st.sidebar.markdown to st.markdown
     st.markdown("### 📅 Date Filters")
-    for col_name, label in [
-        ("tglspk", "Tanggal SPK"),
-        ("tglterima", "Tanggal Terima"),
-        ("tglinputspk", "Tanggal Input SPK"),
-    ]:
-        mask = date_range_mask(col_name, label)
-        if mask is not None:
-            masks.append(mask)
+    add_date_slider("tglspk", "Tanggal SPK")
+    add_date_slider("tglterima", "Tanggal Terima")
+    add_date_slider("tglinputspk", "Tanggal Input SPK")
 
-    st.form_submit_button(label="Apply Filters", use_container_width=True)
-
-filtered_df = df[reduce(and_, masks)] if masks else df
+    # Add the submit button at the bottom of the form
+    submit_button = st.form_submit_button(label="Apply Filters", use_container_width=True)
 
 # ==========================================
-# 6. DASHBOARD METRICS (compact cards, right under the title)
+# 5. DASHBOARD METRICS (SCORE CARDS)
 # ==========================================
-status_counts = filtered_df["status_pembebanan"].value_counts()
-sudah_count = int(status_counts.get("Sudah", 0))
-belum_count = int(status_counts.get("Belum", 0))
-total_count = len(filtered_df)
+sudah_count = len(filtered_df[filtered_df["status_pembebanan"] == "Sudah"]) if "status_pembebanan" in filtered_df.columns else 0
+belum_count = len(filtered_df[filtered_df["status_pembebanan"] == "Belum"]) if "status_pembebanan" in filtered_df.columns else 0
 
-card1, card2, card3 = st.columns(3)
+col1, col2, col3, col4 = st.columns([1, 1, 1, 1.5])
 
-with card1:
-    with st.container(border=True):
-        st.metric(label="✅ Status: Sudah", value=f"{sudah_count:,}")
+with col1:
+    st.metric(label="✅ Status: Sudah", value=f"{sudah_count:,}")
 
-with card2:
-    with st.container(border=True):
-        st.metric(label="🟡 Status: Belum", value=f"{belum_count:,}")
+with col2:
+    st.metric(label="⏳ Status: Belum", value=f"{belum_count:,}")
 
-with card3:
-    with st.container(border=True):
-        st.metric(label="Total Records", value=f"{total_count:,}")
+with col3:
+    st.metric(label="Total Records", value=f"{len(filtered_df):,}")
+
+with col4:
+    st.write("") 
+    if st.button("🔄 Refresh / Reset Data", use_container_width=True):
+        load_data.clear()
+        st.rerun()
+
+st.markdown("---")
 
 # ==========================================
-# 7. DISPLAY DATABASE TABLE (PAGINATED + HIGHLIGHT)
+# 6. DISPLAY DATABASE TABLE (REORDER & RENAME)
 # ==========================================
-# Sending every row to the browser is the slowest part of a big dashboard.
-# Only the rows of the current page are serialised and sent.
-PAGE_SIZE_OPTIONS = [500, 1000, 5000, "All"]
+st.subheader(f"Penerimaan LSN ({len(filtered_df)} results)")
 
-table_title_col, size_col, page_col = st.columns([3, 1, 1])
+# Define the exact column order requested
+target_order = [
+    "namabengkel", 
+    "no_spk", 
+    "status_pembebanan", 
+    "tglspk", 
+    "tglterima", 
+    "tglinputspk"
+]
 
-with size_col:
-    page_size_choice = st.selectbox(
-        "Rows per page",
-        PAGE_SIZE_OPTIONS,
-        index=1,
-        format_func=lambda n: "All rows" if n == "All" else f"{n:,} rows per page",
-        label_visibility="collapsed",
-    )
+# Ensure we only try to reorder columns that actually exist in the dataframe
+available_cols = [col for col in target_order if col in filtered_df.columns]
+remaining_cols = [col for col in filtered_df.columns if col not in available_cols]
+final_order = available_cols + remaining_cols
 
-page_size = max(total_count, 1) if page_size_choice == "All" else page_size_choice
-total_pages = max(1, math.ceil(total_count / page_size))
+# Reorder the dataframe
+display_df = filtered_df[final_order].copy()
 
-page = 1
-with page_col:
-    if total_pages > 1:
-        page = st.selectbox(
-            "Page",
-            list(range(1, total_pages + 1)),
-            format_func=lambda p: f"Page {p:,} of {total_pages:,}",
-            label_visibility="collapsed",
-        )
+# Rename the columns for the UI
+column_mapping = {
+    "namabengkel": "Nama Bengkel",
+    "no_spk": "No SPK",
+    "tglspk": "tgl SPK",
+    "tglterima": "tgl terima",
+    "tglinputspk": "tgl input SPK",
+    "status_pembebanan": "Status Pembebanan"
+}
+display_df = display_df.rename(columns=column_mapping)
 
-with table_title_col:
-    st.markdown(
-        f'<div class="table-title">Penerimaan LSN ({total_count:,} results)</div>',
-        unsafe_allow_html=True,
-    )
-
-start_row = (page - 1) * page_size
-page_df = filtered_df.iloc[start_row:start_row + page_size]
-
-# Small copy of just this page: dates become "YYYY-MM-DD" text (ISO text still
-# sorts correctly) so they display cleanly next to the highlighted column.
-view = page_df.copy()
-for col in DATE_COLS:
-    view[col] = view[col].dt.strftime("%Y-%m-%d").fillna("")
-
-
-def highlight_belum(column):
-    return [HIGHLIGHT_BELUM if value == "Belum" else "" for value in column]
-
-
-table = view
-if not view.empty and view.size <= STYLER_MAX_CELLS:
-    try:
-        table = view.style.apply(highlight_belum, subset=["status_pembebanan"])
-    except Exception:
-        table = view  # highlighting is cosmetic: never break the table over it
-elif view.size > STYLER_MAX_CELLS:
-    st.caption("⚠️ Yellow highlight is off for this many rows. Choose a smaller page size.")
-
-# Fit the table height to the rows (no empty space for short results).
-table_height = max(120, min(640, 35 * (len(view) + 1) + 3))
-
+# Render the formatted table
 st.dataframe(
-    table,
+    display_df,
     use_container_width=True,
     hide_index=True,
-    height=table_height,
-    column_order=[
-        "namabengkel",
-        "no_spk",
-        "status_pembebanan",
-        "tglspk",
-        "tglterima",
-        "tglinputspk",
-    ],
-    column_config={
-        "namabengkel": "Nama Bengkel",
-        "no_spk": "No SPK",
-        "status_pembebanan": "Status Pembebanan",
-        "tglspk": "tgl SPK",
-        "tglterima": "tgl terima",
-        "tglinputspk": "tgl input SPK",
-    },
+    height=600
 )
 
 # ==========================================
-# 8. FOOTER
+# 7. FOOTER
 # ==========================================
+st.markdown("---")
 st.caption("SPK Table Dashboard | MySQL Database")
